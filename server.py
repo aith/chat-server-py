@@ -16,6 +16,7 @@ MESSAGE_CHUNK = 1024
 
 class Server:
     rooms = collections.defaultdict(list)
+    tasks = collections.defaultdict(list)  # per user
 
     def __init__(self, host, port):
         asyncio.run(self.main(host, port))
@@ -28,22 +29,24 @@ class Server:
         byts = b''
         while chunk := await loop.sock_recv(connection, 1024):
             byts += chunk
-            print(byts)
-            if self.is_eol(byts):
-                text = str(byts[:-2], encoding='utf8')
-                try:
+            try:
+                if self.is_oob(byts):
+                    raise ValueError
+                if self.is_eol(byts):
+                    text = str(byts[:-2], encoding='utf8')
                     cmd, room, user = re.split('\s+|\n+', text)
                     self.do_commands(connection, loop, cmd, room, user)
-                except ValueError:
-                    pass
-                finally:
-                    byts = b''
-
+            except ValueError:
+                asyncio.create_task(self.send_msg(connection, loop, f"ERROR\n"))
+                connection.close()
+                return
 
     def do_commands(self, connection: socket, loop: AbstractEventLoop, cmd, room, user):
         if cmd.upper() == 'JOIN' and self.is_valid_name(room) and self.is_valid_name(user):
             asyncio.create_task(self.send_msg(connection, loop, f"You're going to room {room} as {user}\n"))
             asyncio.create_task(self.handle_chat(connection, loop, cmd, room, user))
+        else:
+            raise ValueError
 
 
     async def handle_chat(self, connection: socket, loop: AbstractEventLoop, cmd, room, user) -> None:
@@ -59,20 +62,28 @@ class Server:
                 msg = bytes(f"{user}: ", encoding='utf8') + msg
                 for user_socket in self.rooms[room]:
                     await loop.sock_sendall(user_socket, msg)
+            msg = b''
 
     def is_valid_name(self, st: str):
         # check is ascii and no non-printables
         return re.match('^[\x21-\x7F]+$', st) is not None and len(st) >= 1 and len(st) <= 20
 
+    def is_oob(self, byts):
+        return len(byts) > MESSAGE_MAX
+
     def is_eol(self, byts):
         return byts[-2:] == b'\r\n'
 
+
     async def listen_for_connection(self, server_socket: socket, loop: AbstractEventLoop):
+        # for signame in {'SIGINT', 'SIGTERM'}:
+        #     loop.add_signal_handler(getattr(signal, signame), shutdown)
+
         while True:
             connection, address = await loop.sock_accept(server_socket)  # Stops until Event Loop gets a socket w data
             connection.setblocking(False)
-            asyncio.create_task(self.send_msg(connection, loop, "hello! input something.\n"))
             print(f"Got a connection from {address}")
+            asyncio.create_task(self.send_msg(connection, loop, "Format: JOIN {ROOMNAME} {USERNAME}\n"))
             asyncio.create_task(self.get_commands(connection, loop))
 
     async def send_msg(self, connection: socket, loop: AbstractEventLoop, st: str):
@@ -81,7 +92,7 @@ class Server:
     async def main(self, host, port):
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_address = (host, port)
-        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # allow the port be to reused
+        # server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # allow the port be to reused
         server_socket.setblocking(False)
         server_socket.bind(server_address)
         server_socket.listen()
@@ -90,10 +101,16 @@ class Server:
 
 if __name__ == '__main__':
     port = 0
+    host = 0
     try:
-        port = int(sys.argv[1])
+        host = int(sys.argv[1])
+        port = int(sys.argv[2])
+        if port < 0 or port > 65535:
+            print("Error: invalid port number")
+            sys.exit(1)
     except:
         port = DEFAULT_PORT
+        host = 'localhost'
     n = os.fork()
     if True:
         if n > 0:  # SHADOW
@@ -108,6 +125,6 @@ if __name__ == '__main__':
                 exit(0)
         else:  # MAIN SERVER PROCESS
             try:
-                s = Server('127.0.0.1', port)
+                s = Server(host, port)
             except ConnectionError:  # some unrecoverable error or segfault, so restart the server
                 exit(1)
