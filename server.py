@@ -9,23 +9,70 @@ import asyncio
 import socket
 import collections
 from asyncio import AbstractEventLoop
+import logging
 
 DEFAULT_PORT = 1234
+DEFAULT_HOST = '0.0.0.0'
 MESSAGE_MAX = 20002
 MESSAGE_CHUNK = 1024
 
+
 class Server:
-    rooms = collections.defaultdict(list)
-    tasks = collections.defaultdict(list)  # per user
+    rooms = collections.defaultdict(list);
+    RoomType = collections.namedtuple('RoomType', ('connection', 'userid'))
 
-    def __init__(self, host, port):
-        asyncio.run(self.main(host, port))
+    def __init__(self):
+        pass
 
-    async def echo(self, connection: socket, loop: AbstractEventLoop) -> None:
-        while data := await loop.sock_recv(connection, 1024):
-            await loop.sock_sendall(connection, data)
+    def is_valid_name(self, st: str):
+        return re.match('^[\x21-\x7F]+$', st) is not None and len(st) >= 1 and len(st) <= 20
 
-    async def get_commands(self, connection: socket, loop: AbstractEventLoop) -> None:
+    def is_oob(self, byts):
+        return len(byts) > MESSAGE_MAX
+
+    def is_eol(self, byts):
+        return byts[-2:] == b'\r\n'
+
+    async def broadcast(self, connection: socket, loop: AbstractEventLoop, cmd, room, user, msg: bytes) -> None:
+        if not self.rooms[room]:  # room is now empty, so delete it
+            del self.rooms[room]
+        else:
+            for idx, user_info in enumerate(self.rooms[room]):
+                uid = None
+                try:
+                    user_sock, uid = user_info
+                    await loop.sock_sendall(user_sock, msg)
+                except BrokenPipeError as e:  # attempted to send data to client who has left, so remove them and alert others
+                    print("Removing connection " + str(self.rooms[room].pop(idx)))
+                    asyncio.create_task(self.broadcast(connection, loop, cmd, room, user,
+                                                       bytes(f'{uid} has left the room\n', encoding='utf8')))
+
+    async def do_chat(self, connection: socket, loop: AbstractEventLoop, cmd, room, user) -> None:
+        # join
+        for user_info in self.rooms[room]:
+            user_sock, uid = user_info
+            await loop.sock_sendall(user_sock, bytes(f'{user} has joined\n', encoding='utf8'))
+        self.rooms[room].append(self.RoomType(connection, user))
+        msg = b''
+        try:
+            while chunk := await loop.sock_recv(connection, 1024):
+                msg += chunk
+                if self.is_eol(msg):
+                    msg = bytes(f"{user}: ", encoding='utf8') + msg
+                    asyncio.create_task(self.broadcast(connection, loop, cmd, room, user, msg))
+                msg = b''
+        except BrokenPipeError:  # This user has exited
+            connection.close()
+
+
+    def parse_cmd(self, connection: socket, loop: AbstractEventLoop, cmd, room, user):
+        if cmd.upper() == 'JOIN' and self.is_valid_name(room) and self.is_valid_name(user):
+            asyncio.create_task(self.send_msg(connection, loop, f"You're going to room {room} as {user}\n"))
+            asyncio.create_task(self.do_chat(connection, loop, cmd, room, user))
+        else:
+            raise ValueError
+
+    async def get_cmd(self, connection: socket, loop: AbstractEventLoop) -> None:
         byts = b''
         while chunk := await loop.sock_recv(connection, 1024):
             byts += chunk
@@ -35,68 +82,30 @@ class Server:
                 if self.is_eol(byts):
                     text = str(byts[:-2], encoding='utf8')
                     cmd, room, user = re.split('\s+|\n+', text)
-                    self.do_commands(connection, loop, cmd, room, user)
+                    self.parse_cmd(connection, loop, cmd, room, user)
             except ValueError:
                 asyncio.create_task(self.send_msg(connection, loop, f"ERROR\n"))
                 connection.close()
                 return
 
-    def do_commands(self, connection: socket, loop: AbstractEventLoop, cmd, room, user):
-        if cmd.upper() == 'JOIN' and self.is_valid_name(room) and self.is_valid_name(user):
-            asyncio.create_task(self.send_msg(connection, loop, f"You're going to room {room} as {user}\n"))
-            asyncio.create_task(self.handle_chat(connection, loop, cmd, room, user))
-        else:
-            raise ValueError
+    async def send_msg(self, connection: socket, loop: AbstractEventLoop, st: str):
+        await loop.sock_sendall(connection, bytes(st, encoding='utf8'))
 
-
-    async def handle_chat(self, connection: socket, loop: AbstractEventLoop, cmd, room, user) -> None:
-        # join
-        for user_socket in self.rooms[room]:
-            await loop.sock_sendall(user_socket, bytes(f'{user} has joined\n', encoding='utf8'))
-        self.rooms[room].append(connection)
-        msg = b''
-        while chunk := await loop.sock_recv(connection, 1024):
-            msg += chunk
-            if self.is_eol(msg):
-                # broadcast str
-                msg = bytes(f"{user}: ", encoding='utf8') + msg
-                for user_socket in self.rooms[room]:
-                    await loop.sock_sendall(user_socket, msg)
-            msg = b''
-
-    def is_valid_name(self, st: str):
-        # check is ascii and no non-printables
-        return re.match('^[\x21-\x7F]+$', st) is not None and len(st) >= 1 and len(st) <= 20
-
-    def is_oob(self, byts):
-        return len(byts) > MESSAGE_MAX
-
-    def is_eol(self, byts):
-        return byts[-2:] == b'\r\n'
-
-
-    async def listen_for_connection(self, server_socket: socket, loop: AbstractEventLoop):
-        # for signame in {'SIGINT', 'SIGTERM'}:
-        #     loop.add_signal_handler(getattr(signal, signame), shutdown)
-
+    async def listen(self, server_socket: socket, loop: AbstractEventLoop):
         while True:
             connection, address = await loop.sock_accept(server_socket)  # Stops until Event Loop gets a socket w data
             connection.setblocking(False)
             print(f"Got a connection from {address}")
             asyncio.create_task(self.send_msg(connection, loop, "Format: JOIN {ROOMNAME} {USERNAME}\n"))
-            asyncio.create_task(self.get_commands(connection, loop))
+            asyncio.create_task(self.get_cmd(connection, loop))
 
-    async def send_msg(self, connection: socket, loop: AbstractEventLoop, st: str):
-        await loop.sock_sendall(connection, bytes(st, encoding='utf8'))
-
-    async def main(self, host, port):
+    async def start(self, host, port):
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_address = (host, port)
-        # server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # allow the port be to reused
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # allow the port be to reused
         server_socket.setblocking(False)
-        server_socket.bind(server_address)
+        server_socket.bind((host, port))
         server_socket.listen()
-        await self.listen_for_connection(server_socket, asyncio.get_event_loop())
+        await self.listen(server_socket, asyncio.get_event_loop())
 
 
 if __name__ == '__main__':
@@ -106,25 +115,26 @@ if __name__ == '__main__':
         host = int(sys.argv[1])
         port = int(sys.argv[2])
         if port < 0 or port > 65535:
-            print("Error: invalid port number")
+            print("Error: invalid host or port number")
             sys.exit(1)
     except:
         port = DEFAULT_PORT
-        host = 'localhost'
-    n = os.fork()
-    if True:
-        if n > 0:  # SHADOW
-            print(f"PARENT {os.getpid()} is waiting for {n}")
+        host = DEFAULT_HOST
+    forkid = os.fork()
+    while True:
+        if forkid > 0:  # SHADOW
+            print(f"PARENT {os.getpid()} is waiting for {forkid}")
             try:
-                (pid, status) = os.waitpid(n, 0)
-                n = os.fork()  # Try again
+                (pid, status) = os.waitpid(forkid, 0)
+                forkid = os.fork()  # Try again
             except OSError:  # Irrecoverable error
                 print("Could not fork server head. Restarting.")
-            except KeyboardInterrupt:  # Irrecoverable error
+            except KeyboardInterrupt:
                 print("Fully exiting.")
                 exit(0)
-        else:  # MAIN SERVER PROCESS
+        else:  # MAIN
             try:
-                s = Server(host, port)
+                server = Server()
+                asyncio.run(server.start(host, port))
             except ConnectionError:  # some unrecoverable error or segfault, so restart the server
                 exit(1)
