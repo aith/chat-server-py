@@ -18,8 +18,7 @@ MESSAGE_CHUNK = 1024
 
 
 class Server:
-    rooms = collections.defaultdict(list);
-    RoomType = collections.namedtuple('RoomType', ('connection', 'userid'))
+    rooms = collections.defaultdict(list); RoomType = collections.namedtuple('RoomType', ('connection', 'userid'))
 
     def __init__(self):
         pass
