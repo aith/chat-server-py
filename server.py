@@ -44,7 +44,7 @@ class Server:
                 await loop.sock_sendall(user_sock, msg)
             except BrokenPipeError as e:  # attempted to send data to client who has left, so remove them and alert others
                 print("Removing connection " + str(self.rooms[room].remove(idx)))
-                loop.create_task(self.broadcast(connection, loop, cmd, room, user,
+                asyncio.create_task(self.broadcast(connection, loop, cmd, room, user,
                                                    bytes(f'{uid} has left\n', encoding='utf8')))
         if not self.rooms[room]:  # room is now empty, so delete it
             del self.rooms[room]
@@ -63,7 +63,7 @@ class Server:
                     raise ValueError
                 if self.is_eol(msg):
                     msg = bytes(f"{user}: ", encoding='utf8') + msg
-                    loop.create_task(self.broadcast(connection, loop, cmd, room, user, msg))
+                    asyncio.create_task(self.broadcast(connection, loop, cmd, room, user, msg))
                 msg = b''
         except BrokenPipeError:  # This user has exited
             connection.close()
@@ -71,7 +71,7 @@ class Server:
 
     def parse_cmd(self, connection: socket, loop: AbstractEventLoop, cmd, room, user):
         if cmd.upper() == 'JOIN' and self.is_valid_name(room) and self.is_valid_name(user):
-            loop.create_task(self.do_chat(connection, loop, cmd, room, user))
+            asyncio.create_task(self.do_chat(connection, loop, cmd, room, user))
         else:
             raise ValueError
 
@@ -81,14 +81,13 @@ class Server:
             byts += chunk
             try:
                 if self.is_oob(byts):
-                    byts = b''
-                    continue
+                    raise ValueError # might be too extreme
                 if self.is_eol(byts):
-                    text = str(self.remove_newline(byts), encoding='utf8')
+                    text = str(byts[:-2], encoding='utf8')  # remove the implicit -2
                     cmd, room, user = re.split('\s+|\n+', text)
                     self.parse_cmd(connection, loop, cmd, room, user)
-            except ValueError:  # propagated from parse_cmd
-                loop.create_task(self.send_msg(connection, loop, f"ERROR\n"))
+            except ValueError:
+                asyncio.create_task(self.send_msg(connection, loop, f"ERROR\n"))
                 connection.close()
                 return
 
@@ -100,8 +99,8 @@ class Server:
             connection, address = await loop.sock_accept(server_socket)  # Stops until Event Loop gets a socket w data
             connection.setblocking(False)
             print(f"Got a connection from {address}")
-            loop.create_task(self.send_msg(connection, loop, "Format: JOIN {ROOMNAME} {USERNAME}\n"))
-            loop.create_task(self.get_cmd(connection, loop))
+            asyncio.create_task(self.send_msg(connection, loop, "Format: JOIN {ROOMNAME} {USERNAME}\n"))
+            asyncio.create_task(self.get_cmd(connection, loop))
 
     async def start(self, host, port):
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -109,7 +108,7 @@ class Server:
         server_socket.setblocking(False)
         server_socket.bind((host, port))
         server_socket.listen()
-        await self.listen(server_socket, loop.get_event_loop())
+        await self.listen(server_socket, asyncio.get_event_loop())
 
 
 if __name__ == '__main__':
