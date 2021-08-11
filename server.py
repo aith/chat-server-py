@@ -1,20 +1,16 @@
 #!/usr/bin/env python3.8
 
-import signal
 import sys
 import os
 import re
-import time
 import asyncio
 import socket
 import collections
 from asyncio import AbstractEventLoop
-import logging
-from dataclasses import dataclass
 
 DEFAULT_PORT = 1234
 DEFAULT_HOST = '0.0.0.0'
-NEWLINE = '\r'
+NEWLINE = '\n'
 MESSAGE_MAX = 20000
 MESSAGE_CHUNK = 1024
 
@@ -38,16 +34,21 @@ class Server:
         return byts[:-1] if byts[-1] == NEWLINE else byts
 
     async def broadcast(self, connection: socket, loop: AbstractEventLoop, cmd, room, user, msg: bytes) -> None:
+        if not self.rooms[room]:  # room is now empty, so delete it
+            del self.rooms[room]
+        to_removes = []
         for idx, user_info in enumerate(self.rooms[room]):
             user_sock, uid = user_info
             try:
                 await loop.sock_sendall(user_sock, msg)
             except BrokenPipeError as e:  # attempted to send data to client who has left, so remove them and alert others
-                print("Removing connection " + str(self.rooms[room].remove(idx)))
-                asyncio.create_task(self.broadcast(connection, loop, cmd, room, user,
-                                                   bytes(f'{uid} has left\n', encoding='utf8')))
-        if not self.rooms[room]:  # room is now empty, so delete it
-            del self.rooms[room]
+                to_removes.append(user_info)
+        gone_now = []
+        for to_remove in to_removes:
+            gone_now.append(to_remove[1])
+            self.rooms[room].remove(to_remove)
+        for gone in gone_now:
+            asyncio.create_task(self.broadcast(socket, loop, cmd, room, user,  bytes(f"{gone} has left\n", encoding='utf8')))
 
     async def do_chat(self, connection: socket, loop: AbstractEventLoop, cmd, room, user) -> None:
         # join
